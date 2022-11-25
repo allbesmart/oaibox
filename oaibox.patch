@@ -1,0 +1,485 @@
+commit a5dd6b917c04008ce447dea7f3a68bbb524e31e2
+Author: luis_pereira87 <lpereira@allbesmart.pt>
+Date:   Fri Nov 25 08:59:57 2022 +0000
+
+    oaibox
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 7124548c39..d21d858c93 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2778,6 +2778,7 @@ add_executable(nr-softmodem
+   ${OPENAIR_DIR}/executables/nr-ru.c
+   ${OPENAIR_DIR}/executables/nr-softmodem.c
+   ${OPENAIR_DIR}/executables/softmodem-common.c
++  ${OPENAIR_DIR}/executables/oaibox_data_export.c
+   ${OPENAIR1_DIR}/SIMULATION/TOOLS/taus.c
+   ${OPENAIR_DIR}/radio/COMMON/common_lib.c
+   ${OPENAIR_DIR}/radio/COMMON/record_player.c
+@@ -2806,6 +2807,7 @@ target_link_libraries (nr-softmodem ${LIBXML2_LIBRARIES})
+ target_link_libraries (nr-softmodem pthread m CONFIG_LIB rt crypt ${CRYPTO_LIBRARIES} ${OPENSSL_LIBRARIES} sctp  ${XFORMS_LIBRARIES} ${PROTOBUF_LIB}  ${CMAKE_DL_LIBS} ${LIBYAML_LIBRARIES} ${ATLAS_LIBRARIES})
+ target_link_libraries (nr-softmodem ${LIB_LMS_LIBRARIES})
+ target_link_libraries (nr-softmodem ${T_LIB})
++target_link_libraries (nr-softmodem paho-mqtt3cs)
+ 
+ add_dependencies( nr-softmodem ldpc_orig ldpc_optim ldpc_optim8seg ldpc)
+ 
+diff --git a/executables/nr-gnb.c b/executables/nr-gnb.c
+index 63209862c4..db9c99e6af 100644
+--- a/executables/nr-gnb.c
++++ b/executables/nr-gnb.c
+@@ -86,7 +86,7 @@
+ #include <openair1/PHY/NR_TRANSPORT/nr_ulsch.h>
+ #include <openair1/PHY/NR_TRANSPORT/nr_dlsch.h>
+ #include <PHY/NR_ESTIMATION/nr_ul_estimation.h>
+-
++#include <oaibox_data_export.h>
+ //#define USRP_DEBUG 1
+ // Fix per CC openair rf/if device update
+ // extern openair0_device openair0;
+@@ -477,6 +477,7 @@ void init_gNB_Tpool(int inst) {
+   threadCreate(&proc->pthread_tx_reorder, tx_reorder_thread, (void *)gNB, "thread_tx_reorder", 
+ 		  gNB->RU_list[0] ? gNB->RU_list[0]->tpcores[1] : -1, OAI_PRIORITY_RT_MAX);
+ 
++  threadCreate(&proc->oaibox_data_export_thread, oaibox_data_export_func, (void *)NULL, "oaibox_data_export_thread", -1, OAI_PRIORITY_RT_LOW);
+ }
+ 
+ 
+diff --git a/executables/oaibox_data_export.c b/executables/oaibox_data_export.c
+new file mode 100644
+index 0000000000..2977ed9e01
+--- /dev/null
++++ b/executables/oaibox_data_export.c
+@@ -0,0 +1,355 @@
++//
++// Created by user on 14/10/21.
++//
++#ifndef OAIBOX_DATA_EXPORT
++#define OAIBOX_DATA_EXPORT
++
++// #define OAIBOX_DEBUG
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <arpa/inet.h>
++#include <sys/time.h>
++#include "common/ran_context.h"
++#include <softmodem-common.h>
++#include "LAYER2/NR_MAC_gNB/mac_proto.h"
++#include "openair2/RRC/NR/rrc_gNB_UE_context.h"
++#include "MQTTClient.h"
++
++// MQTT DEFINES
++#define ADDRESS "wss://rabbit.oaibox.com/ws"
++#define QOS 1
++#define UPDATE_INTERVAL 1 // Seconds
++
++char client_uuid[41];
++char gnb_config_topic[128];
++char topic[128];
++
++int32_t config_message_timer = 1;
++
++#define DATA_EXPORT_BUFFER_SIZE 8094
++char buffer[DATA_EXPORT_BUFFER_SIZE];
++
++volatile MQTTClient_deliveryToken deliveredtoken;
++
++void delivered(void *context, MQTTClient_deliveryToken dt)
++{
++#ifdef OAIBOX_DEBUG
++  printf("OAIBOX Message with token value %d delivery confirmed\n", dt);
++#endif
++  deliveredtoken = dt;
++}
++
++int msgarrvd(void *context, char *topicName, int topicLen, MQTTClient_message *message)
++{
++  int i;
++  char *payloadptr;
++  printf("Message arrived\n");
++  printf("     topic: %s\n", topicName);
++  printf("   message: ");
++  payloadptr = message->payload;
++  for (i = 0; i < message->payloadlen; i++) {
++    putchar(*payloadptr++);
++  }
++  putchar('\n');
++  MQTTClient_freeMessage(&message);
++  MQTTClient_free(topicName);
++  return 1;
++}
++
++void connlost(void *context, char *cause)
++{
++  printf("\nOAIBOX Connection lost with cause: %s\n", cause);
++}
++
++void gen_uuid(char *buf)
++{
++  struct timeval tp_cur;
++  gettimeofday(&tp_cur, NULL);
++  srand(tp_cur.tv_usec);
++
++  char v[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
++  // 3fb17ebc-bc38-4939-bc8b-74f2443281d4
++  // oai dash 8 dash 4 dash 4 dash 4 dash 12
++  sprintf(buf, "oai-");
++
++  // gen random for all spaces because lazy
++  for (int i = 4; i < 40; ++i) {
++    buf[i] = v[rand() % 16];
++  }
++
++  // put dashes in place
++  buf[12] = '-';
++  buf[17] = '-';
++  buf[22] = '-';
++  buf[27] = '-';
++
++  // needs end byte
++  buf[40] = '\0';
++}
++
++int get_tv_cur_minus_given(struct timeval *tv, struct timeval *tp_given, int *sign)
++{
++  struct timeval tp_cur;
++  gettimeofday(&tp_cur, NULL);
++
++  tv->tv_sec = tp_cur.tv_sec - tp_given->tv_sec;
++  tv->tv_usec = tp_cur.tv_usec - tp_given->tv_usec;
++
++  if (tv->tv_sec > 0) {
++    *sign = 1;
++    if (tv->tv_usec < 0) {
++      tv->tv_sec--;
++      tv->tv_usec = 1000000 + tv->tv_usec;
++    }
++  } else {
++    if (tv->tv_sec == 0) {
++      if (tv->tv_usec == 0) {
++        *sign = 0;
++      } else {
++        if (tv->tv_usec < 0) {
++          *sign = -1;
++          tv->tv_usec *= -1;
++        } else {
++          *sign = 1;
++        }
++      }
++    } else {
++      *sign = -1;
++      if (tv->tv_usec > 0) {
++        tv->tv_sec++;
++        tv->tv_usec = 1000000 - tv->tv_usec;
++      } else {
++        if (tv->tv_usec < 0)
++          tv->tv_usec *= -1;
++      }
++    }
++  }
++  return 0;
++}
++
++void *oaibox_data_export_func()
++{
++  struct timeval tv_last_run;
++  struct timeval tv_diff;
++  int sign;
++  uint64_t time = 0;
++
++  // Get tenantId
++  sprintf(gnb_config_topic, "configuration.gNB.%s", get_softmodem_params()->tenantId);
++  sprintf(topic, "telemetry.gNB.%s", get_softmodem_params()->tenantId);
++
++  // Generate a random client_uuid
++  gen_uuid(client_uuid);
++#ifdef OAIBOX_DEBUG
++  printf("OAIBOX client_id: %s\n", client_uuid);
++#endif
++
++  if (strlen(gnb_config_topic) <= 24 || strlen(topic) <= 20) {
++    usleep(100000);
++    printf("OAIBOX error parsing tenantId\n");
++    exit(-1);
++  }
++
++  // Connect to MQTT broker
++  MQTTClient client;
++  MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer_ws;
++  MQTTClient_SSLOptions ssl_opts = MQTTClient_SSLOptions_initializer;
++  MQTTClient_message pubmsg = MQTTClient_message_initializer;
++  MQTTClient_deliveryToken token;
++  int rc;
++  MQTTClient_create(&client, ADDRESS, client_uuid, MQTTCLIENT_PERSISTENCE_NONE, NULL);
++  conn_opts.username = "dashboard";
++  conn_opts.password = "dashboard";
++  conn_opts.ssl = &ssl_opts;
++  conn_opts.keepAliveInterval = 20;
++  conn_opts.cleansession = 1;
++
++  MQTTClient_setCallbacks(client, NULL, connlost, msgarrvd, delivered);
++  if ((rc = MQTTClient_connect(client, &conn_opts)) != MQTTCLIENT_SUCCESS) {
++    printf("OAIBOX Failed to connect, return code %d\n", rc);
++    exit(EXIT_FAILURE);
++  }
++
++  while (!oai_exit) {
++    // Need to send initial configurations periodically otherwise if the dashboard was not running from the beginning (or restarted)
++    // then it will never show the configurations
++    config_message_timer--;
++    if (config_message_timer <= 0) {
++      config_message_timer = 10;
++
++      // Send initial message with gNB configurations
++      NR_FrequencyInfoDL_t *frequencyInfoDL = RC.nrmac[0]->common_channels[0].ServingCellConfigCommon->downlinkConfigCommon->frequencyInfoDL;
++      NR_FrequencyInfoUL_t *frequencyInfoUL = RC.nrmac[0]->common_channels[0].ServingCellConfigCommon->uplinkConfigCommon->frequencyInfoUL;
++
++      sprintf(buffer,
++              "{\"id\": %ld, "
++              "\"pci\": %d, "
++              "\"nrBand\": %ld, "
++              "\"dlCarrierFreq\": %lu, "
++              "\"ulCarrierFreq\": %lu, "
++              "\"absoluteFrequencyPointA\": %ld, "
++              "\"absoluteFrequencySSB\": %ld, "
++              "\"dlBandwidth\": %ld, "
++              "\"ulBandwidth\": %ld, "
++              "\"subcarrierSpacing\": %d, "
++              "\"mcc\": %d, "
++              "\"mnc\": %d}",
++              RC.nrrrc[0]->nr_cellid,
++              RC.nrmac[0]->common_channels[0].physCellId,
++              *frequencyInfoDL->frequencyBandList.list.array[0],
++              RC.gNB[0]->frame_parms.dl_CarrierFreq,
++              RC.gNB[0]->frame_parms.ul_CarrierFreq,
++              frequencyInfoDL->absoluteFrequencyPointA,
++              *frequencyInfoDL->absoluteFrequencySSB,
++              frequencyInfoDL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth,
++              frequencyInfoUL->scs_SpecificCarrierList.list.array[0]->carrierBandwidth,
++              (15000 << frequencyInfoDL->scs_SpecificCarrierList.list.array[0]->subcarrierSpacing),
++              RC.nrrrc[0]->configuration.mcc[0],
++              RC.nrrrc[0]->configuration.mnc[0]);
++
++      pubmsg.payload = buffer;
++      pubmsg.payloadlen = strlen(buffer);
++      pubmsg.qos = QOS;
++      pubmsg.retained = 0;
++      deliveredtoken = 0;
++      MQTTClient_publishMessage(client, gnb_config_topic, &pubmsg, &token);
++
++#ifdef OAIBOX_DEBUG
++      printf("OAIBOX Waiting for publication of message:\n%s\nOn topic: %s for client with ClientID: %s\n", buffer, gnb_config_topic, client_uuid);
++#endif
++    } // if (config_message_timer <= 0)
++
++    // Get useconds until the next run and usleep for that amount of time
++    get_tv_cur_minus_given(&tv_diff, &tv_last_run, &sign);
++    int useconds = (UPDATE_INTERVAL * 1000000) - (tv_diff.tv_sec * 1000000 + tv_diff.tv_usec);
++    if (useconds > 0.0 && useconds < 30000000) {
++      usleep(useconds);
++    }
++
++    // Update timestamp
++    gettimeofday(&tv_last_run, NULL);
++    time = tv_last_run.tv_sec * (uint64_t)1000000 + tv_last_run.tv_usec;
++
++    sprintf(buffer,
++            "{\"id\": %ld, "
++            "\"frame\": %d, "
++            "\"slot\": %d, "
++            "\"pci\": %d, "
++            "\"ues\": [",
++            RC.nrrrc[0]->nr_cellid,
++            RC.gNB[0]->UL_INFO.frame,
++            RC.gNB[0]->UL_INFO.slot,
++            RC.nrmac[0]->common_channels[0].physCellId);
++
++    int ue_counter = 0;
++
++    UE_iterator(RC.nrmac[0]->UE_info.list, UE)
++    {
++      if (ue_counter > 0) {
++        sprintf(&buffer[strlen(buffer)], ", ");
++      }
++      ue_counter++;
++
++      NR_mac_stats_t *mac_stats = &UE->mac_stats;
++      long rsrp = mac_stats->num_rsrp_meas > 0 ? mac_stats->cumul_rsrp / mac_stats->num_rsrp_meas : 0;
++      double rsrq = NAN;
++      double sinr = NAN;
++      float pucch_snr = (float)UE->UE_sched_ctrl.pucch_snrx10 / 10.0;
++      float pusch_snr = (float)UE->UE_sched_ctrl.pusch_snrx10 / 10.0;
++      float rssi = (float)UE->UE_sched_ctrl.raw_rssi / 10.0;
++
++      // RRC Measurements values
++      struct rrc_gNB_ue_context_s *ue_context_p = rrc_gNB_get_ue_context(RC.nrrrc[0], UE->rnti);
++      if (ue_context_p && ue_context_p->ue_context.measResults) {
++        if (ue_context_p->ue_context.measResults->measResultServingMOList.list.count > 1)
++          LOG_W(RRC, "Received %d MeasResultServMO, but handling only 1!\n", ue_context_p->ue_context.measResults->measResultServingMOList.list.count);
++
++        NR_MeasResultServMO_t *measresultservmo = ue_context_p->ue_context.measResults->measResultServingMOList.list.array[0];
++        NR_MeasResultNR_t *measresultnr = &measresultservmo->measResultServingCell;
++        NR_MeasQuantityResults_t *mqr = measresultnr->measResult.cellResults.resultsSSB_Cell;
++
++        if (mqr != NULL) {
++          rsrp = *mqr->rsrp - 156;
++          rsrq = (float)(*mqr->rsrq - 87) / 2.0f;
++          sinr = (float)(*mqr->sinr - 46) / 2.0f;
++        }
++      }
++
++      sprintf(&buffer[strlen(buffer)],
++              "{"
++              "\"rnti\": \"%04x\", "
++              "\"dlBytes\": %" PRIu64
++              ", "
++              "\"dlMcs\": %d, "
++              "\"dlBler\": %f, "
++              "\"ulBytes\": %" PRIu64
++              ", "
++              "\"ulMcs\": %d, "
++              "\"ulBler\": %f, "
++              "\"cqi\": %d, "
++              "\"ri\": %d, "
++              "\"pmi\": \"(%d,%d)\", ",
++              UE->rnti,
++              UE->mac_stats.dl.total_bytes, // sum byte values from all LCIDs
++              UE->UE_sched_ctrl.dl_bler_stats.mcs,
++              UE->UE_sched_ctrl.dl_bler_stats.bler,
++              UE->mac_stats.ul.total_bytes,
++              UE->UE_sched_ctrl.ul_bler_stats.mcs,
++              UE->UE_sched_ctrl.ul_bler_stats.bler,
++              UE->UE_sched_ctrl.CSI_report.cri_ri_li_pmi_cqi_report.wb_cqi_1tb,
++              UE->UE_sched_ctrl.CSI_report.cri_ri_li_pmi_cqi_report.ri + 1,
++              UE->UE_sched_ctrl.CSI_report.cri_ri_li_pmi_cqi_report.pmi_x1,
++              UE->UE_sched_ctrl.CSI_report.cri_ri_li_pmi_cqi_report.pmi_x2);
++
++      if (!isnan(rsrq)) {
++        sprintf(&buffer[strlen(buffer)], "\"rsrq\": %.1f, ", rsrq);
++      }
++      if (!isnan(sinr)) {
++        sprintf(&buffer[strlen(buffer)], "\"sinr\": %.1f, ", sinr);
++      }
++
++      sprintf(&buffer[strlen(buffer)],
++              "\"rsrp\": %ld, "
++              "\"rssi\": %.1f, "
++              "\"pucchSnr\": %.1f, "
++              "\"puschSnr\": %.1f}",
++              rsrp,
++              rssi,
++              pucch_snr,
++              pusch_snr);
++    }
++    sprintf(&buffer[strlen(buffer)], "], \"timestamp\": %ju}", time);
++
++    pubmsg.payload = buffer;
++    pubmsg.payloadlen = strlen(buffer);
++    pubmsg.qos = QOS;
++    pubmsg.retained = 0;
++    deliveredtoken = 0;
++    MQTTClient_publishMessage(client, topic, &pubmsg, &token);
++
++#ifdef OAIBOX_DEBUG
++    printf("OAIBOX Waiting for publication of message:\n%s\nOn topic: %s for client with ClientID: %s\n", buffer, topic, client_uuid);
++#endif
++
++    while (deliveredtoken != token) {
++      usleep(10000);
++    }
++
++    // Add an exit condition
++    if (buffer[0] == 0) {
++      printf("OAIBOX Client exiting....");
++      break;
++    }
++  }
++
++  // Close the connection to MQTT broker
++  MQTTClient_disconnect(client, 10000);
++  MQTTClient_destroy(&client);
++
++  return NULL;
++}
++
++#endif
+\ No newline at end of file
+diff --git a/executables/oaibox_data_export.h b/executables/oaibox_data_export.h
+new file mode 100644
+index 0000000000..5e44b391fb
+--- /dev/null
++++ b/executables/oaibox_data_export.h
+@@ -0,0 +1,10 @@
++//
++// Created by user on 14/10/21.
++//
++
++#ifndef OPENAIRINTERFACE_OAIBOX_DATA_EXPORT_H
++#define OPENAIRINTERFACE_OAIBOX_DATA_EXPORT_H
++
++void *oaibox_data_export_func();
++
++#endif //OPENAIRINTERFACE_OAIBOX_DATA_EXPORT_H
+diff --git a/executables/softmodem-common.h b/executables/softmodem-common.h
+index 67def9e2ef..22fd540037 100644
+--- a/executables/softmodem-common.h
++++ b/executables/softmodem-common.h
+@@ -131,6 +131,7 @@ extern "C"
+ #define NON_STOP            softmodem_params.non_stop
+ #define EMULATE_L1          softmodem_params.emulate_l1
+ #define CONTINUOUS_TX       softmodem_params.continuous_tx
++#define TENANTID            softmodem_params.tenantId
+ 
+ #define DEFAULT_RFCONFIG_FILE    "/usr/local/etc/syriq/ue.band7.tm1.PRB100.NR40.dat";
+ 
+@@ -171,7 +172,8 @@ extern int usrp_tx_thread;
+     {"non-stop",             CONFIG_HLP_NONSTOP,      PARAMFLAG_BOOL, iptr:&NON_STOP,                     defintval:0,           TYPE_INT,    0},                     \
+     {"emulate-l1",           CONFIG_L1_EMULATOR,      PARAMFLAG_BOOL, iptr:&EMULATE_L1,                   defintval:0,           TYPE_INT,    0},                     \
+     {"continuous-tx",        CONFIG_HLP_CONTINUOUS_TX,PARAMFLAG_BOOL, iptr:&CONTINUOUS_TX,                defintval:0,           TYPE_INT,    0},                     \
+-    {"disable-stats",        CONFIG_HLP_STATS_DISABLE, PARAMFLAG_BOOL, iptr:&stats_disabled,               defintval:0,           TYPE_INT,    0},                     \
++    {"disable-stats",        CONFIG_HLP_STATS_DISABLE, PARAMFLAG_BOOL, iptr:&stats_disabled,               defintval:0,           TYPE_INT,    0},                    \
++    {"tenantId",             NULL,                    0,              strptr:&TENANTID,                   defstrval:NULL,         TYPE_STRING, 0},      \
+   }
+ 
+ #define CONFIG_HLP_NSA           "Enable NSA mode \n"
+@@ -268,6 +270,7 @@ typedef struct {
+   int            non_stop;
+   int            emulate_l1;
+   int            continuous_tx;
++  char           *tenantId;
+ } softmodem_params_t;
+ 
+ extern uint64_t get_softmodem_optmask(void);
+diff --git a/openair1/PHY/defs_gNB.h b/openair1/PHY/defs_gNB.h
+index fca93b29c7..7bb61545c0 100644
+--- a/openair1/PHY/defs_gNB.h
++++ b/openair1/PHY/defs_gNB.h
+@@ -632,6 +632,8 @@ typedef struct gNB_L1_proc_t_s {
+   int RU_mask_prach;
+   /// set of scheduling variables RXn-TXnp4 threads
+   gNB_L1_rxtx_proc_t L1_proc, L1_proc_tx;
++  /// pthread structure for dumping gNB stats
++  pthread_t oaibox_data_export_thread;
+ } gNB_L1_proc_t;
+ 
+ 
+diff --git a/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf b/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+index ccfd5ea56c..ef93ea7e50 100644
+--- a/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
++++ b/targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf
+@@ -191,9 +191,11 @@ MACRLCs = (
+   num_cc                      = 1;
+   tr_s_preference             = "local_L1";
+   tr_n_preference             = "local_RRC";
+-  pusch_TargetSNRx10          = 150;
++  pusch_TargetSNRx10          = 300;
+   pucch_TargetSNRx10          = 200;
++  pusch_FailureThres          = 1000;
+   ulsch_max_frame_inactivity  = 0;
++  ul_max_mcs                  = 28;
+ }
+ );
+ 
